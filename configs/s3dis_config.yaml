@@ -1,0 +1,53 @@
+# S3DIS dataset NKSR reconstruction configuration file
+
+# Data path configuration
+data:
+  data_root: "S3DIS/raw/S3DIS/data/Stanford3dDataset_v1.2_Aligned_Version/"              # S3DIS dataset root directory
+  output_root: "outputs/s3dis_reconstruction"  # Output results directory
+  area_name: "Area_6"                  # Area name
+  room_name: office_2                    # Room name, null means processing entire area
+
+
+# NKSR reconstruction parameters
+nksr:
+  detail_level: 0.15                   # Detail level (0.0-1.0) - more lenient for sparse point clouds
+  voxel_size: 0.03                     # Voxel size, 3cm precision - adapted for sparse point clouds
+  chunked: true                        # Whether to use chunked reconstruction
+  chunk_size: 60.0                     # Chunk size - larger chunks
+  device: "cuda"                       # Computing device: force GPU usage
+
+# Data preprocessing parameters
+preprocessing:
+  estimate_normals: true               # Whether to estimate normals
+  use_shs_net: false                   # Whether to use SHS-Net for normal estimation (true=SHS-Net, false=Open3D PCA)
+  shs_model_path: "SHS-Net-main/log/001/ckpts/ckpt_800.pt"  # SHS-Net pretrained model path
+  normal_search_radius: 0.1            # Normal estimation search radius - more lenient for sparse point clouds (Open3D only)
+  normal_max_nn: 30                    # Maximum number of neighbors for normal estimation - moderate (Open3D only)
+  remove_outliers: true               # Whether to remove outliers - keep more points for sparse point clouds
+  outlier_nb_neighbors: 20             # Number of neighbors for outlier detection - more lenient
+  outlier_std_ratio: 2.0               # Standard deviation ratio for outlier detection - more lenient
+  # Added in s3dis_config.yaml
+  shs_fast_mode: true        # Enable fast mode
+  shs_batch_size: 128        # Batch size
+# Sparsification experiment parameters
+sparsity_experiments:
+  - name: "dense"
+    keep_ratio: 1.0
+    occlusion: false
+
+# Visualization parameters
+visualization:
+  save_visualizations: false            # Whether to save visualization results
+  save_intermediate_results: false      # Whether to save intermediate results
+  max_vis_points: 10000               # Maximum number of points for visualization
+  save_normal_visualizations: true  # Enable normal vector visualization
+  use_high_quality_visualization: true  # Enable high-quality visualization
+  use_surface_reconstruction: true      # Use surface reconstruction
+  image_format: "auto"                   # Automatically select format
+  jpg_quality: 95                        # JPG quality
+  save_original_files: false
+# Evaluation parameters
+evaluation:
+  max_eval_points: 100000             # Maximum number of points for evaluation
+  compute_chamfer: false               # Whether to compute Chamfer distance
+  compute_mesh_quality: false         # Whether to compute mesh quality
