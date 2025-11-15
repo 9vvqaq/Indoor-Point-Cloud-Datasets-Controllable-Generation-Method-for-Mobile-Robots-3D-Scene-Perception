@@ -300,36 +300,63 @@ class AutoTrajectoryGenerator:
     def _create_trajectory_candidate(self, start_point: np.ndarray, 
                                    end_point: np.ndarray, 
                                    num_waypoints: int) -> Optional[TrajectoryCandidate]:
-        """Create trajectory candidate (with full collision detection)."""
+        """
+        Create trajectory candidate using A* path planning.
+        Uses graph search to find shortest path, then smooths if needed.
+        Collisions are handled by scoring system (collision_count in quality assessment).
+        """
         try:
-            # Generate straight trajectory points (Z coordinate already fixed)
-            waypoints = []
-            
-            for i in range(num_waypoints):
-                t = i / (num_waypoints - 1) if num_waypoints > 1 else 0
+            free_space_points = self.room_analysis.free_space_points
+            if len(free_space_points) < 2:
+                # Fallback to direct linear interpolation
+                waypoints = self._generate_linear_waypoints(start_point, end_point, num_waypoints)
+            else:
+                # Find nearest free space points to start and end
+                start_idx = self._find_nearest_free_space_point(start_point, free_space_points)
+                end_idx = self._find_nearest_free_space_point(end_point, free_space_points)
                 
-                x = start_point[0] + t * (end_point[0] - start_point[0])
-                y = start_point[1] + t * (end_point[1] - start_point[1])
-                z = start_point[2] + t * (end_point[2] - start_point[2])  # Z coordinate interpolation (start and end Z are same)
-                
-                waypoint = Waypoint(x=x, y=y, z=z, yaw=0)
-                waypoints.append(waypoint)
+                if start_idx is None or end_idx is None:
+                    # Fallback to direct linear interpolation
+                    waypoints = self._generate_linear_waypoints(start_point, end_point, num_waypoints)
+                else:
+                    # Use A* to find shortest path in connectivity graph
+                    path_indices = self._a_star_search(start_idx, end_idx, free_space_points)
+                    
+                    if path_indices is None or len(path_indices) < 2:
+                        # No path found, fallback to direct linear interpolation
+                        waypoints = self._generate_linear_waypoints(start_point, end_point, num_waypoints)
+                    else:
+                        # Convert path indices to actual points
+                        path_points = [free_space_points[idx] for idx in path_indices]
+                        
+                        # Add start and end points if not already included
+                        if not np.allclose(path_points[0], start_point, atol=0.1):
+                            path_points.insert(0, start_point)
+                        if not np.allclose(path_points[-1], end_point, atol=0.1):
+                            path_points.append(end_point)
+                        
+                        # If path is essentially straight (only 2 points), use linear interpolation
+                        if len(path_points) == 2:
+                            waypoints = self._generate_linear_waypoints(path_points[0], path_points[1], num_waypoints)
+                        else:
+                            # Multi-segment path: generate waypoints and smooth
+                            waypoints = self._generate_waypoints_along_path(path_points, num_waypoints)
+                            # Smooth the path to reduce unnecessary turns
+                            waypoints = self._smooth_trajectory(waypoints)
             
-            # Check collisions along trajectory path
+            # Count collisions (but don't reject - let scoring system handle it)
             collision_count = 0
             for waypoint in waypoints:
+                point = np.array([waypoint.x, waypoint.y, waypoint.z])
+                
                 # Check if within room boundaries
-                if not self._is_point_in_room_bounds(np.array([waypoint.x, waypoint.y, waypoint.z]), self.room_analysis.bounds):
-                    collision_count += 1  # Out of bounds
+                if not self._is_point_in_room_bounds(point, self.room_analysis.bounds):
+                    collision_count += 1
                     continue
                 
                 # Check if collides with mesh
-                if self._is_point_inside_mesh(np.array([waypoint.x, waypoint.y, waypoint.z]), self.room_analysis.mesh):
-                    collision_count += 1  # Collision with mesh
-            
-            # If trajectory has collisions, reject directly
-            if collision_count > 0:
-                return None
+                if self._is_point_inside_mesh(point, self.room_analysis.mesh):
+                    collision_count += 1
             
             # Calculate trajectory length
             length = self._calculate_trajectory_length(waypoints)
@@ -337,14 +364,14 @@ class AutoTrajectoryGenerator:
             # Calculate smoothness score
             smoothness_score = self._calculate_smoothness_score(waypoints)
             
-            # Create quality assessment
+            # Create quality assessment (collision_count will be used in scoring)
             quality = TrajectoryQuality(
-                coverage_ratio=1.0,  # No collision trajectory
+                coverage_ratio=1.0 - (collision_count / len(waypoints)) if waypoints else 0.0,
                 path_length=length,
-                turn_count=0,  # Straight trajectory
-                efficiency=1.0,  # Efficient
-                collision_count=0,  # No collision
-                smoothness=1.0  # Completely smooth
+                turn_count=self._count_turns(waypoints),
+                efficiency=1.0 if collision_count == 0 else max(0.0, 1.0 - collision_count / len(waypoints)),
+                collision_count=collision_count,  # Important: include collision count for scoring
+                smoothness=smoothness_score
             )
             
             return TrajectoryCandidate(
@@ -353,12 +380,212 @@ class AutoTrajectoryGenerator:
                 waypoints=waypoints,
                 quality=quality,
                 length=length,
-                collision_count=0,  # No collision
+                collision_count=collision_count,  # Store collision count
                 smoothness_score=smoothness_score
             )
             
         except Exception as e:
             return None
+    
+    def _generate_linear_waypoints(self, start_point: np.ndarray, 
+                                  end_point: np.ndarray, 
+                                  num_waypoints: int) -> List[Waypoint]:
+        """Generate waypoints by linear interpolation."""
+        waypoints = []
+        for i in range(num_waypoints):
+            t = i / (num_waypoints - 1) if num_waypoints > 1 else 0
+            x = start_point[0] + t * (end_point[0] - start_point[0])
+            y = start_point[1] + t * (end_point[1] - start_point[1])
+            z = start_point[2] + t * (end_point[2] - start_point[2])
+            waypoint = Waypoint(x=x, y=y, z=z, yaw=0)
+            waypoints.append(waypoint)
+        return waypoints
+    
+    def _find_nearest_free_space_point(self, point: np.ndarray, 
+                                      free_space_points: List[np.ndarray]) -> Optional[int]:
+        """Find the index of the nearest free space point."""
+        if not free_space_points:
+            return None
+        distances = [np.linalg.norm(np.array(p) - point) for p in free_space_points]
+        nearest_idx = np.argmin(distances)
+        return nearest_idx
+    
+    def _a_star_search(self, start_idx: int, end_idx: int, 
+                      free_space_points: List[np.ndarray]) -> Optional[List[int]]:
+        """
+        A* path search in connectivity graph.
+        Returns list of point indices forming the shortest path, or None if no path found.
+        """
+        if start_idx == end_idx:
+            return [start_idx]
+        
+        connectivity_graph = self.room_analysis.connectivity_graph
+        
+        # A* algorithm
+        open_set = {start_idx}
+        closed_set = set()
+        g_score = {start_idx: 0.0}  # Cost from start to node
+        f_score = {}  # Estimated total cost
+        came_from = {}
+        
+        # Heuristic: Euclidean distance
+        def heuristic(idx1, idx2):
+            p1 = free_space_points[idx1]
+            p2 = free_space_points[idx2]
+            return np.linalg.norm(p1 - p2)
+        
+        f_score[start_idx] = heuristic(start_idx, end_idx)
+        
+        while open_set:
+            # Find node with lowest f_score
+            current = min(open_set, key=lambda x: f_score.get(x, float('inf')))
+            
+            if current == end_idx:
+                # Reconstruct path
+                path = []
+                while current is not None:
+                    path.append(current)
+                    current = came_from.get(current)
+                return path[::-1]  # Reverse to get start to end
+            
+            open_set.remove(current)
+            closed_set.add(current)
+            
+            # Check neighbors
+            neighbors = connectivity_graph.get(current, [])
+            for neighbor in neighbors:
+                if neighbor in closed_set:
+                    continue
+                
+                # Distance between current and neighbor
+                tentative_g = g_score[current] + heuristic(current, neighbor)
+                
+                if neighbor not in open_set:
+                    open_set.add(neighbor)
+                elif tentative_g >= g_score.get(neighbor, float('inf')):
+                    continue  # Not a better path
+                
+                # This path is better
+                came_from[neighbor] = current
+                g_score[neighbor] = tentative_g
+                f_score[neighbor] = tentative_g + heuristic(neighbor, end_idx)
+        
+        return None  # No path found
+    
+    def _generate_waypoints_along_path(self, path_points: List[np.ndarray], 
+                                      num_waypoints: int) -> List[Waypoint]:
+        """
+        Generate waypoints along a multi-segment path.
+        Distributes waypoints proportionally along each segment.
+        """
+        if len(path_points) < 2:
+            return []
+        
+        # Calculate total path length
+        segment_lengths = []
+        total_length = 0.0
+        for i in range(len(path_points) - 1):
+            length = np.linalg.norm(path_points[i+1] - path_points[i])
+            segment_lengths.append(length)
+            total_length += length
+        
+        if total_length < 1e-6:
+            # All points are the same, return single waypoint
+            p = path_points[0]
+            return [Waypoint(x=p[0], y=p[1], z=p[2], yaw=0)]
+        
+        # Generate waypoints
+        waypoints = []
+        segment_idx = 0
+        
+        for i in range(num_waypoints):
+            if i == num_waypoints - 1:
+                # Last waypoint: use last path point
+                p = path_points[-1]
+                waypoints.append(Waypoint(x=p[0], y=p[1], z=p[2], yaw=0))
+                break
+            
+            # Calculate target distance along path
+            target_distance = (i / (num_waypoints - 1)) * total_length
+            
+            # Find which segment contains this distance
+            segment_start_dist = 0.0
+            for seg_idx, seg_length in enumerate(segment_lengths):
+                segment_end_dist = segment_start_dist + seg_length
+                
+                if target_distance <= segment_end_dist:
+                    # This waypoint is in current segment
+                    segment_progress = (target_distance - segment_start_dist) / seg_length if seg_length > 0 else 0
+                    p1 = path_points[seg_idx]
+                    p2 = path_points[seg_idx + 1]
+                    p = p1 + segment_progress * (p2 - p1)
+                    waypoints.append(Waypoint(x=p[0], y=p[1], z=p[2], yaw=0))
+                    break
+                else:
+                    segment_start_dist = segment_end_dist
+        
+        return waypoints
+    
+    def _smooth_trajectory(self, waypoints: List[Waypoint], alpha: float = 0.5) -> List[Waypoint]:
+        """
+        Smooth trajectory using simple moving average.
+        Reduces unnecessary turns while preserving overall path shape.
+        """
+        if len(waypoints) < 3:
+            return waypoints
+        
+        smoothed = [waypoints[0]]  # Keep first waypoint
+        
+        for i in range(1, len(waypoints) - 1):
+            prev = waypoints[i-1]
+            curr = waypoints[i]
+            next_wp = waypoints[i+1]
+            
+            # Simple smoothing: weighted average
+            x = alpha * curr.x + (1 - alpha) * (prev.x + next_wp.x) / 2
+            y = alpha * curr.y + (1 - alpha) * (prev.y + next_wp.y) / 2
+            z = alpha * curr.z + (1 - alpha) * (prev.z + next_wp.z) / 2
+            
+            smoothed.append(Waypoint(x=x, y=y, z=z, yaw=curr.yaw))
+        
+        smoothed.append(waypoints[-1])  # Keep last waypoint
+        return smoothed
+    
+    def _count_turns(self, waypoints: List[Waypoint]) -> int:
+        """Count number of significant turns in trajectory."""
+        if len(waypoints) < 3:
+            return 0
+        
+        turn_count = 0
+        angle_threshold = np.pi / 6  # 30 degrees
+        
+        for i in range(1, len(waypoints) - 1):
+            # Calculate direction vectors
+            v1 = np.array([
+                waypoints[i].x - waypoints[i-1].x,
+                waypoints[i].y - waypoints[i-1].y
+            ])
+            v2 = np.array([
+                waypoints[i+1].x - waypoints[i].x,
+                waypoints[i+1].y - waypoints[i].y
+            ])
+            
+            # Normalize
+            norm1 = np.linalg.norm(v1)
+            norm2 = np.linalg.norm(v2)
+            
+            if norm1 > 1e-6 and norm2 > 1e-6:
+                v1 = v1 / norm1
+                v2 = v2 / norm2
+                
+                # Calculate angle between vectors
+                dot_product = np.clip(np.dot(v1, v2), -1.0, 1.0)
+                angle = np.arccos(dot_product)
+                
+                if angle > angle_threshold:
+                    turn_count += 1
+        
+        return turn_count
     
     def _calculate_trajectory_length(self, waypoints: List[Waypoint]) -> float:
         """Calculate trajectory length."""
